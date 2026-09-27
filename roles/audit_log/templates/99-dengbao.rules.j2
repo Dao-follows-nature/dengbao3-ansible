@@ -1,0 +1,45 @@
+## 等保三级审计规则 - 由 Ansible 自动管理（dengbao3-ansible）
+## 位于 /etc/audit/rules.d/，由 augenrules 合并加载；手工修改会在下次执行 playbook 时被覆盖
+## 参数调整请修改 inventory/group_vars/all.yml 中 audit_* 变量后重新运行
+
+## 删除已有规则，设置缓冲区大小与故障级别
+-D
+-b {{ audit_buffer_size }}
+-f 1
+
+## 1. 身份鉴别文件与账户变更监控（identity）
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+
+## 2. 登录与会话记录监控（logins/session）
+-w /var/log/lastlog -p wa -k logins
+-w /var/run/utmp -p wa -k session
+-w /var/log/btmp -p wa -k session
+-w /var/log/wtmp -p wa -k session
+
+## 3. SSH 服务配置变更监控（sshd_config）
+-w /etc/ssh/sshd_config -p wa -k sshd_config
+
+## 4. 系统时间变更监控（time-change）
+-a always,exit -F arch=b64 -S adjtimex,settimeofday -F key=time-change
+-a always,exit -F arch=b32 -S adjtimex,settimeofday,stime -F key=time-change
+-a always,exit -F arch=b64 -S clock_settime -F a0=0x0 -F key=time-change
+-a always,exit -F arch=b32 -S clock_settime -F a0=0x0 -F key=time-change
+-w /etc/localtime -p wa -k time-change
+
+## 5. 主机名与系统区域配置监控（system-locale）
+-a always,exit -F arch=b64 -S sethostname,setdomainname -F key=system-locale
+-a always,exit -F arch=b32 -S sethostname,setdomainname -F key=system-locale
+-w /etc/issue -p wa -k system-locale
+-w /etc/hosts -p wa -k system-locale
+
+## 6. 按系统实际情况监控的附加路径（缺失路径已自动跳过）
+{% for w in audit_optional_watches %}
+-w {{ w.path }} -p wa -k {{ w.key }}
+{% endfor %}
+{% if audit_rules_immutable | bool %}
+
+## 7. 审计规则设为不可变（-e 2：重启后生效，修改规则前需重启系统）
+-e 2
+{% endif %}

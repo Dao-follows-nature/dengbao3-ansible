@@ -1,0 +1,138 @@
+---
+# =====================================================================
+# 等保三级 - 任务4：开启审计日志（auditd）
+# 安装并启用审计服务，配置日志保留策略，部署等保审计规则：
+#   身份鉴别文件、登录与会话记录、SSH 配置、系统时间变更、
+#   主机名/系统区域配置等
+# 包名：RedHat 系（OpenEuler/Anolis/Rocky/CentOS/Kylin）为 audit，
+#       Debian/Ubuntu 系为 auditd
+# =====================================================================
+
+- name: 安装审计软件包（auditd）
+  ansible.builtin.package:
+    name: "{{ 'audit' if ansible_facts['os_family'] == 'RedHat' else 'auditd' }}"
+    state: present
+  tags: [audit_log]
+
+# ---------- 内核审计能力检测 ----------
+# 容器/嵌套虚拟化环境中，内核审计 netlink 常被宿主占用或禁用（EPERM），
+# auditd 无法真正运行；此时部署配置与规则但跳过启动，并给出明确警告。
+# 真实物理机/虚拟机上 auditctl -s 正常返回，角色将严格启动 auditd（失败即中止）。
+- name: 检测内核审计子系统是否可用（auditctl -s）
+  ansible.builtin.command: auditctl -s
+  register: audit_kernel_check
+  changed_when: false
+  failed_when: false
+  tags: [audit_log]
+
+- name: 记录内核审计可用性
+  ansible.builtin.set_fact:
+    audit_kernel_supported: "{{ audit_kernel_check.rc | default(1) == 0 }}"
+  tags: [audit_log]
+
+- name: 警告 - 内核审计子系统不可用（跳过 auditd 启动与规则加载）
+  ansible.builtin.debug:
+    msg:
+      - "[警告] auditctl -s 执行失败（rc={{ audit_kernel_check.rc | default(1) }}），当前环境内核审计子系统不可用。"
+      - "常见原因：容器/嵌套虚拟化环境（宿主已占用审计 netlink）、内核引导参数 audit=0。"
+      - "已部署 auditd 配置与审计规则文件（/etc/audit/rules.d/99-dengbao.rules）；"
+      - "在真实物理机/虚拟机上执行本 playbook 时 auditd 将正常启动并加载规则。"
+  when: not audit_kernel_supported | bool
+  tags: [audit_log]
+
+# ---------- 监控目标预检查 ----------
+# audit 的 -w 监控要求目标存在：登录日志与部分配置文件在容器/最小化系统中可能缺失
+- name: 检查审计监控的登录/会话日志文件是否存在
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+  loop:
+    - { path: /var/log/lastlog, group: utmp, mode: "0664" }
+    - { path: /var/run/utmp,    group: utmp, mode: "0664" }
+    - { path: /var/log/wtmp,    group: utmp, mode: "0664" }
+    - { path: /var/log/btmp,    group: utmp, mode: "0600" }
+  register: audit_watch_files
+  tags: [audit_log]
+
+- name: 创建缺失的登录/会话日志文件（-w 监控要求目标已存在）
+  ansible.builtin.file:
+    path: "{{ item.item.path }}"
+    state: touch
+    owner: root
+    group: "{{ item.item.group }}"
+    mode: "{{ item.item.mode }}"
+  when: not item.stat.exists
+  loop: "{{ audit_watch_files.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  tags: [audit_log]
+
+- name: 检查可选审计监控路径（gshadow/sudoers/网络配置目录等，容器或最小化系统可能缺失）
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+  loop:
+    - { path: /etc/gshadow,           key: identity }
+    - { path: /etc/sudoers,           key: sudoers }
+    - { path: /etc/sudoers.d,         key: sudoers }
+    - { path: /etc/sysconfig/network, key: system-locale }
+    - { path: /etc/network,           key: system-locale }
+  register: audit_optional_paths
+  tags: [audit_log]
+
+- name: 汇总存在的可选监控路径（缺失的自动跳过对应规则）
+  ansible.builtin.set_fact:
+    audit_optional_watches: "{{ audit_optional_paths.results | selectattr('stat.exists') | map(attribute='item') | list }}"
+  tags: [audit_log]
+
+# ---------- 审计服务配置 ----------
+- name: 配置审计日志保留策略（/etc/audit/auditd.conf）
+  ansible.builtin.lineinfile:
+    path: /etc/audit/auditd.conf
+    regexp: '^{{ item.key }}\s*='
+    line: "{{ item.key }} = {{ item.value }}"
+    state: present
+  loop:
+    - { key: "max_log_file",        value: "{{ audit_max_log_file }}" }
+    - { key: "num_logs",            value: "{{ audit_num_logs }}" }
+    - { key: "max_log_file_action", value: "ROTATE" }
+  notify: 重启 auditd
+  tags: [audit_log]
+
+- name: 部署等保审计规则（/etc/audit/rules.d/99-dengbao.rules）
+  ansible.builtin.template:
+    src: 99-dengbao.rules.j2
+    dest: /etc/audit/rules.d/99-dengbao.rules
+    owner: root
+    group: root
+    mode: "0640"
+  notify: 重载审计规则
+  tags: [audit_log]
+
+- name: 设置审计服务开机自启（auditd）
+  ansible.builtin.systemd:
+    name: auditd
+    enabled: true
+  tags: [audit_log]
+
+- name: 启动审计服务（auditd）
+  ansible.builtin.systemd:
+    name: auditd
+    state: started
+  when: audit_kernel_supported | bool
+  tags: [audit_log]
+
+- name: 输出审计日志说明
+  ansible.builtin.debug:
+    msg:
+      - "审计服务 auditd 已启动并设为开机自启，日志位于 /var/log/audit/audit.log。"
+      - "规则已部署到 /etc/audit/rules.d/99-dengbao.rules 并加载至内核（auditctl -l 可查看）。"
+      - "审计查询示例：ausearch -k identity（身份变更）、ausearch -k logins（登录事件）、aureport（汇总报表）。"
+  when: audit_kernel_supported | bool
+  tags: [audit_log]
+
+- name: 输出审计部署说明（内核审计不可用环境）
+  ansible.builtin.debug:
+    msg:
+      - "审计软件包、配置与规则文件已全部部署完成；因当前环境内核审计不可用，auditd 未启动。"
+      - "迁移到真实物理机/虚拟机后，auditd 将随开机自启并自动加载 /etc/audit/rules.d/ 下的规则。"
+  when: not audit_kernel_supported | bool
+  tags: [audit_log]

@@ -1,0 +1,56 @@
+---
+# =====================================================================
+# 等保三级（MLPS 三级）安全基线加固 - 主 Playbook
+# 适配：OpenEuler / Anolis OS / Rocky Linux / CentOS / Ubuntu / Kylin V10
+#   任务1：口令复杂度 + 口令 90 天定期更改（password_policy）
+#   任务2：登录失败 5 次锁定 10 分钟 + 10 分钟无操作自动退出（login_lock）
+#   任务3：SSH 加固 - 禁用 root 登录 + 修改 SSH 端口（ssh_hardening）
+#   任务4：开启审计日志 - auditd 规则与日志保留策略（audit_log）
+# =====================================================================
+- name: 等保三级安全基线加固
+  hosts: all
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: 计算系统主版本（兼容 Kylin V10 等非数字版本号，"V10" → 10）
+      ansible.builtin.set_fact:
+        os_major_version: "{{ ansible_facts['distribution_major_version'] | regex_replace('[^0-9]', '') | int }}"
+      tags: [always]
+
+    - name: 安全预检 - 禁止在禁用 root 登录的同时用 root 连接（防止失联）
+      ansible.builtin.fail:
+        msg: |
+          [预检失败] 检测到 Ansible 正在使用 root 用户连接目标主机，
+          而本次加固将设置 PermitRootLogin={{ ssh_permit_root_login }}，加固后将无法再通过 root SSH 登录！
+          请先在目标机创建普通运维用户（加入 sudo/wheel 组，配置免密或密码 sudo），
+          并在 inventory/hosts.yml 中将 ansible_user 改为该用户后重新执行。
+      when:
+        - ssh_permit_root_login | lower == 'no'
+        - ansible_user | default('root') == 'root'
+      tags: [always]
+
+  roles:
+    - role: password_policy
+      tags: [password_policy]
+    - role: login_lock
+      tags: [login_lock]
+    - role: ssh_hardening
+      tags: [ssh_hardening]
+    - role: audit_log
+      tags: [audit_log]
+
+- name: 使用新端口验证 SSH 连通性
+  hosts: all
+  gather_facts: false
+  vars:
+    ansible_port: "{{ ssh_new_port }}"
+  tasks:
+    - name: 验证新端口 SSH 连通（ping）
+      ansible.builtin.ping:
+      tags: [verify]
+
+    - name: 输出验证结果
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}：新端口 {{ ssh_new_port }} SSH 连通正常，加固完成。"
+      tags: [verify]

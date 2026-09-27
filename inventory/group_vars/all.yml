@@ -1,0 +1,33 @@
+# =====================================================================
+# 等保三级安全基线 - 全局参数（按需调整，改完重新运行即可，全量幂等）
+# =====================================================================
+
+# ---------- 任务1：口令复杂度策略 + 口令定期更改策略 ----------
+pass_max_days: 90          # 口令最长有效期：90 天内必须更换（等保要求）
+pass_min_days: 1           # 两次修改口令的最小间隔天数
+pass_min_len: 8            # 口令最短长度 8 位（login.defs）
+pass_warn_age: 7           # 口令过期前 7 天开始警告
+
+pw_minlen: 8               # pwquality：口令最小长度不小于 8 位
+pw_minclass: 3             # pwquality：至少包含 大写/小写/数字/特殊符号 中的 3 类字符
+pw_maxrepeat: 3            # 同一字符最多连续出现 3 次
+pw_dictcheck: 1            # 检查口令是否为字典单词
+
+apply_chage_to_existing_users: true   # 对已有可登录账户立即应用 90 天有效期（chage -M）
+
+# ---------- 任务2：登录失败锁定 + 连接超时自动退出 ----------
+login_fail_deny: 5             # 登录连续失败 5 次
+login_fail_unlock_time: 600    # 锁定 10 分钟（600 秒）
+login_fail_fail_interval: 900  # 失败次数统计窗口 15 分钟（900 秒）
+login_fail_even_deny_root: true  # root 账户失败同样锁定（等保建议）
+tmout_seconds: 600             # 登录后 10 分钟（600 秒）无操作自动退出
+
+# ---------- 任务3：SSH 加固 ----------
+ssh_new_port: 2222             # 修改后的 SSH 端口（避开默认 22）
+ssh_permit_root_login: "no"    # 禁用 root 直接 SSH 登录
+
+# ---------- 任务4：审计日志（auditd） ----------
+audit_max_log_file: 30         # 单个审计日志文件上限（MB），达到后按策略轮转
+audit_num_logs: 10             # 日志轮转保留数量
+audit_buffer_size: 8192        # 审计规则缓冲区大小（繁忙系统可适当调大）
+audit_rules_immutable: false   # true 时设置 -e 2（规则不可变，重启后生效，修改需重启系统）

@@ -1,0 +1,21 @@
+---
+# =====================================================================
+# audit_log 角色 handlers
+# 注意：CentOS7 等系统的 auditd.service 带 RefuseManualStop=yes，
+#       systemctl 无法直接重启，需回退 sysv service 脚本
+# =====================================================================
+
+- name: 重启 auditd
+  ansible.builtin.shell: |
+    if systemctl restart auditd 2>/dev/null; then
+      echo "RESTARTED_BY_SYSTEMD"
+    else
+      /usr/sbin/service auditd restart
+    fi
+  args:
+    executable: /bin/bash
+  when: audit_kernel_supported | default(true) | bool
+
+- name: 重载审计规则
+  ansible.builtin.command: augenrules --load
+  when: audit_kernel_supported | default(true) | bool

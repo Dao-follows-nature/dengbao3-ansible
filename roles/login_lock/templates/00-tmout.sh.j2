@@ -1,0 +1,4 @@
+# 等保三级安全基线 - 由 Ansible 自动管理，请勿手工修改
+# 连接超时自动退出：{{ (tmout_seconds / 60) | int }} 分钟（{{ tmout_seconds }} 秒）无操作自动登出
+readonly TMOUT={{ tmout_seconds }}
+export TMOUT

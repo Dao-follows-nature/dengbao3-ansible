@@ -1,0 +1,297 @@
+---
+# =====================================================================
+# 等保三级 - 任务2：登录失败锁定 + 连接超时自动退出
+# 失败 5 次锁定 10 分钟；登录后 10 分钟无操作自动退出
+#
+# 分支策略（写入 PAM 前均校验模块存在，防止写入无效配置导致无法登录）：
+#   RHEL8+（OpenEuler/Anolis8+/Rocky/CentOS8+）且 authselect 已管理:
+#       authselect enable-feature with-faillock + /etc/security/faillock.conf
+#   RHEL8+ 但无 authselect 配置（最小化安装）:
+#       直接在 system-auth/password-auth 写入 pam_faillock
+#   RHEL7（CentOS7/Anolis7）: pam_tally2
+#   Ubuntu 22.04+: pam_faillock；Ubuntu 20.04-: pam_tally2
+# =====================================================================
+
+# ---------- RHEL8+：读取 authselect 状态 ----------
+- name: RHEL8+ 读取 authselect 当前配置
+  ansible.builtin.command: authselect current
+  register: authselect_current
+  changed_when: false
+  failed_when: false
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - os_major_version | int >= 8
+  tags: [login_lock, faillock]
+
+# ---------- 分支A：RHEL8+ 且 authselect 已管理 ----------
+- name: 启用 authselect with-faillock 特性（pam_faillock）
+  ansible.builtin.command: authselect enable-feature with-faillock
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - os_major_version | int >= 8
+    - authselect_current.rc | default(1) == 0
+    - "'with-faillock' not in authselect_current.stdout"
+  tags: [login_lock, faillock]
+
+- name: 配置 /etc/security/faillock.conf（失败{{ login_fail_deny }}次锁定{{ (login_fail_unlock_time / 60) | int }}分钟）
+  ansible.builtin.lineinfile:
+    path: /etc/security/faillock.conf
+    regexp: '^#?\s*{{ item.key }}\s*=.*$'
+    line: "{{ item.key }} = {{ item.value }}"
+    create: true
+    state: present
+  loop:
+    - { key: "deny",          value: "{{ login_fail_deny }}" }
+    - { key: "unlock_time",   value: "{{ login_fail_unlock_time }}" }
+    - { key: "fail_interval", value: "{{ login_fail_fail_interval }}" }
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - os_major_version | int >= 8
+    - authselect_current.rc | default(1) == 0
+  tags: [login_lock, faillock]
+
+- name: 配置 root 账户失败同样锁定（faillock.conf even_deny_root）
+  ansible.builtin.lineinfile:
+    path: /etc/security/faillock.conf
+    regexp: '^#?\s*even_deny_root.*$'
+    line: "even_deny_root"
+    create: true
+    state: present
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - os_major_version | int >= 8
+    - authselect_current.rc | default(1) == 0
+    - login_fail_even_deny_root | bool
+  tags: [login_lock, faillock]
+
+# ---------- 分支B：RHEL8+ 但 authselect 未管理（最小化安装） ----------
+# PAM 顺序（关键）：preauth 在 auth 段顶部；authfail 必须在 pam_unix(sufficient) 之后、
+# pam_deny 之前 —— 仅在认证失败时执行（成功时 sufficient 短路跳过），否则会导致所有人无法登录
+- name: RHEL8+（无 authselect 配置）检查 pam_faillock 模块是否存在
+  ansible.builtin.stat:
+    path: /usr/lib64/security/pam_faillock.so
+  register: rhel_faillock_module
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - os_major_version | int >= 8
+    - authselect_current.rc | default(1) != 0
+  tags: [login_lock, faillock]
+
+- name: RHEL8+ pam_faillock 模块缺失时中止（防止写入无效 PAM 配置）
+  ansible.builtin.fail:
+    msg: "未找到 /usr/lib64/security/pam_faillock.so（libpwquality 应已由 password_policy 角色安装），已中止以防破坏 PAM 导致无法登录。"
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - os_major_version | int >= 8
+    - authselect_current.rc | default(1) != 0
+    - not rhel_faillock_module.stat.exists | default(false)
+  tags: [login_lock, faillock]
+
+- name: RHEL8+ 清理旧版整块 faillock 配置（兼容修正，正常无变化）
+  ansible.builtin.blockinfile:
+    path: "{{ item }}"
+    marker: "# {mark} ANSIBLE MANAGED - dengbao3 faillock"
+    state: absent
+  loop:
+    - /etc/pam.d/system-auth
+    - /etc/pam.d/password-auth
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - os_major_version | int >= 8
+    - authselect_current.rc | default(1) != 0
+    - rhel_faillock_module.stat.exists | default(false)
+  tags: [login_lock, faillock]
+
+- name: RHEL8+ 写入 pam_faillock preauth（auth 段顶部，检查并拦截已锁定账户）
+  ansible.builtin.lineinfile:
+    path: "{{ item }}"
+    regexp: '^auth\s+required\s+pam_faillock\.so\s+preauth.*$'
+    line: "auth       required      pam_faillock.so preauth silent deny={{ login_fail_deny }} unlock_time={{ login_fail_unlock_time }} fail_interval={{ login_fail_fail_interval }}{{ ' even_deny_root' if login_fail_even_deny_root | bool else '' }}"
+    insertafter: '^#%PAM-1\.0'
+    state: present
+  loop:
+    - /etc/pam.d/system-auth
+    - /etc/pam.d/password-auth
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - os_major_version | int >= 8
+    - authselect_current.rc | default(1) != 0
+    - rhel_faillock_module.stat.exists | default(false)
+  tags: [login_lock, faillock]
+
+- name: RHEL8+ 写入 pam_faillock authfail（pam_unix 之后、pam_deny 之前，仅认证失败时记录）
+  ansible.builtin.lineinfile:
+    path: "{{ item }}"
+    regexp: '^auth\s+\[default=die\]\s+pam_faillock\.so\s+authfail.*$'
+    line: "auth       [default=die]  pam_faillock.so authfail deny={{ login_fail_deny }} unlock_time={{ login_fail_unlock_time }} fail_interval={{ login_fail_fail_interval }}{{ ' even_deny_root' if login_fail_even_deny_root | bool else '' }}"
+    insertbefore: '^auth\s+required\s+pam_deny\.so'
+    state: present
+  loop:
+    - /etc/pam.d/system-auth
+    - /etc/pam.d/password-auth
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - os_major_version | int >= 8
+    - authselect_current.rc | default(1) != 0
+    - rhel_faillock_module.stat.exists | default(false)
+  tags: [login_lock, faillock]
+
+# ---------- 分支C：RHEL7（CentOS7/Anolis7）pam_tally2 ----------
+- name: RHEL7 检查 pam_tally2 模块是否存在
+  ansible.builtin.stat:
+    path: /usr/lib64/security/pam_tally2.so
+  register: rhel_tally2_module
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - os_major_version | int < 8
+  tags: [login_lock, tally2]
+
+- name: RHEL7 pam_tally2 模块缺失时中止（防止写入无效 PAM 配置）
+  ansible.builtin.fail:
+    msg: "未找到 /usr/lib64/security/pam_tally2.so，已中止以防破坏 PAM 导致无法登录。"
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - os_major_version | int < 8
+    - not rhel_tally2_module.stat.exists | default(false)
+  tags: [login_lock, tally2]
+
+- name: CentOS7/Anolis7 配置 pam_tally2 登录失败锁定（system-auth/password-auth）
+  ansible.builtin.lineinfile:
+    path: "{{ item }}"
+    regexp: '^auth\s+required\s+pam_tally2\.so.*$'
+    line: "auth       required      pam_tally2.so deny={{ login_fail_deny }} unlock_time={{ login_fail_unlock_time }}{% if login_fail_even_deny_root | bool %} even_deny_root{% endif %}"
+    insertafter: '^#%PAM-1\.0'
+    state: present
+  loop:
+    - /etc/pam.d/system-auth
+    - /etc/pam.d/password-auth
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - os_major_version | int < 8
+    - rhel_tally2_module.stat.exists | default(false)
+  tags: [login_lock, tally2]
+
+# ---------- Ubuntu 22.04+：pam_faillock ----------
+# 结构（关键）：authfail 必须位于 pam_unix 与 pam_deny(requisite) 之间，
+# 并将 pam_unix 的 [success=1] 同步改为 [success=2]（成功时跳过 authfail 与 pam_deny），
+# 否则成功登录也会被 authfail 拒绝 / 失败时记录不到
+- name: Ubuntu 22.04+ 检查 pam_faillock 模块是否存在
+  ansible.builtin.stat:
+    path: "/usr/lib/{{ ansible_facts['architecture'] }}-linux-gnu/security/pam_faillock.so"
+  register: ubu_faillock_module
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - os_major_version | int >= 22
+  tags: [login_lock, faillock]
+
+- name: Ubuntu 22.04+ pam_faillock 模块缺失时中止
+  ansible.builtin.fail:
+    msg: "未找到 pam_faillock.so（libpam-modules 应提供），已中止以防破坏 PAM 导致无法登录。"
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - os_major_version | int >= 22
+    - not ubu_faillock_module.stat.exists | default(false)
+  tags: [login_lock, faillock]
+
+- name: Ubuntu 22.04+ 写入 pam_faillock preauth（pam_unix 之前，拦截已锁定账户）
+  ansible.builtin.lineinfile:
+    path: /etc/pam.d/common-auth
+    regexp: '^auth\s+required\s+pam_faillock\.so\s+preauth.*$'
+    line: "auth    required    pam_faillock.so preauth silent deny={{ login_fail_deny }} unlock_time={{ login_fail_unlock_time }} fail_interval={{ login_fail_fail_interval }}{{ ' even_deny_root' if login_fail_even_deny_root | bool else '' }}"
+    insertbefore: '^auth\s+\[success=\d+ default=ignore\]\s+pam_unix\.so'
+    state: present
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - os_major_version | int >= 22
+    - ubu_faillock_module.stat.exists | default(false)
+  tags: [login_lock, faillock]
+
+- name: Ubuntu 22.04+ 调整 pam_unix 成功跳过计数（success=1 → success=2）
+  ansible.builtin.replace:
+    path: /etc/pam.d/common-auth
+    regexp: '(\[success=)1( default=ignore\]\s+pam_unix\.so)'
+    replace: '\g<1>2\g<2>'
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - os_major_version | int >= 22
+    - ubu_faillock_module.stat.exists | default(false)
+  tags: [login_lock, faillock]
+
+- name: Ubuntu 22.04+ 校验 pam_unix 跳过计数（非预期结构则中止）
+  ansible.builtin.command: grep -E '^\s*auth\s+\[success=2 default=ignore\]\s+pam_unix\.so' /etc/pam.d/common-auth
+  register: ubu_bump_check
+  changed_when: false
+  failed_when: false
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - os_major_version | int >= 22
+    - ubu_faillock_module.stat.exists | default(false)
+  tags: [login_lock, faillock]
+
+- name: Ubuntu 22.04+ 跳过计数校验失败时中止（防止破坏登录）
+  ansible.builtin.fail:
+    msg: |
+      /etc/pam.d/common-auth 的 pam_unix 控制字段与预期不符（应为 [success=1 default=ignore] 或已调整为 [success=2]），
+      为防止写入错误 PAM 顺序导致无法登录，已中止。请人工检查该文件后重试。
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - os_major_version | int >= 22
+    - ubu_faillock_module.stat.exists | default(false)
+    - ubu_bump_check.rc | default(1) != 0
+  tags: [login_lock, faillock]
+
+- name: Ubuntu 22.04+ 写入 pam_faillock authfail（pam_unix 之后、pam_deny 之前，仅失败时记录）
+  ansible.builtin.lineinfile:
+    path: /etc/pam.d/common-auth
+    regexp: '^auth\s+\[default=die\]\s+pam_faillock\.so\s+authfail.*$'
+    line: "auth    [default=die]    pam_faillock.so authfail deny={{ login_fail_deny }} unlock_time={{ login_fail_unlock_time }} fail_interval={{ login_fail_fail_interval }}{{ ' even_deny_root' if login_fail_even_deny_root | bool else '' }}"
+    insertbefore: '^auth\s+requisite\s+pam_deny\.so'
+    state: present
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - os_major_version | int >= 22
+    - ubu_faillock_module.stat.exists | default(false)
+  tags: [login_lock, faillock]
+
+# ---------- Ubuntu 20.04 及以下：pam_tally2 ----------
+- name: Ubuntu 20.04- 检查 pam_tally2 模块是否存在
+  ansible.builtin.stat:
+    path: "/usr/lib/{{ ansible_facts['architecture'] }}-linux-gnu/security/pam_tally2.so"
+  register: ubu_tally2_module
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - os_major_version | int < 22
+  tags: [login_lock, tally2]
+
+- name: Ubuntu 20.04- pam_tally2 模块缺失时中止
+  ansible.builtin.fail:
+    msg: "未找到 pam_tally2.so（libpam-modules 应提供），已中止以防破坏 PAM 导致无法登录。"
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - os_major_version | int < 22
+    - not ubu_tally2_module.stat.exists | default(false)
+  tags: [login_lock, tally2]
+
+- name: Ubuntu 20.04 及以下配置 pam_tally2 登录失败锁定（common-auth）
+  ansible.builtin.blockinfile:
+    path: /etc/pam.d/common-auth
+    marker: "# {mark} ANSIBLE MANAGED - dengbao3 tally2"
+    block: |
+      auth required pam_tally2.so deny={{ login_fail_deny }} unlock_time={{ login_fail_unlock_time }}{% if login_fail_even_deny_root | bool %} even_deny_root{% endif %}
+    insertbefore: '^auth\s+.*pam_unix\.so'
+    state: present
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - os_major_version | int < 22
+    - ubu_tally2_module.stat.exists | default(false)
+  tags: [login_lock, tally2]
+
+# ---------- 连接超时自动退出（全系通用） ----------
+- name: 配置 {{ (tmout_seconds / 60) | int }} 分钟无操作自动退出（/etc/profile.d/00-tmout.sh）
+  ansible.builtin.template:
+    src: 00-tmout.sh.j2
+    dest: /etc/profile.d/00-tmout.sh
+    owner: root
+    group: root
+    mode: "0644"
+  tags: [login_lock, tmout]

@@ -1,0 +1,15 @@
+services:
+  ansible:
+    build: .
+    image: dengbao3-ansible:latest
+    container_name: dengbao3-ansible
+    init: true
+    # 使用宿主机网络，便于直连各网段的目标服务器
+    network_mode: host
+    environment:
+      ANSIBLE_CONFIG: /ansible/ansible.cfg
+    volumes:
+      # 项目目录（playbook/inventory/roles）
+      - ./:/ansible
+      # 宿主机 SSH 密钥（连接目标机用，只读挂载）
+      - ~/.ssh:/root/.ssh:ro

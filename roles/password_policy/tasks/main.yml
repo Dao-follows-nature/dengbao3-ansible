@@ -1,0 +1,109 @@
+---
+# =====================================================================
+# 等保三级 - 任务1：口令复杂度策略 + 口令定期更改策略
+# 适配：OpenEuler / Anolis OS / Rocky / CentOS（RHEL 系）+ Ubuntu（Debian 系）
+# =====================================================================
+
+# ---------- 口令定期更改策略：/etc/login.defs（全系通用） ----------
+- name: 配置口令定期更改策略 /etc/login.defs（最长90天）
+  ansible.builtin.lineinfile:
+    path: /etc/login.defs
+    regexp: '^{{ item.key }}\s+'
+    line: "{{ item.key }}\t{{ item.value }}"
+    state: present
+  loop:
+    - { key: "PASS_MAX_DAYS", value: "{{ pass_max_days }}" }
+    - { key: "PASS_MIN_DAYS", value: "{{ pass_min_days }}" }
+    - { key: "PASS_MIN_LEN",  value: "{{ pass_min_len }}" }
+    - { key: "PASS_WARN_AGE", value: "{{ pass_warn_age }}" }
+  tags: [password_policy, login_defs]
+
+# ---------- 口令复杂度策略：pwquality ----------
+- name: Ubuntu 安装 libpam-pwquality（口令复杂度 PAM 模块）
+  ansible.builtin.apt:
+    name: libpam-pwquality
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_facts['os_family'] == 'Debian'
+  tags: [password_policy, pwquality]
+
+- name: RHEL 系确保已安装 libpwquality（提供 pam_pwquality / pam_faillock 模块）
+  ansible.builtin.package:
+    name: libpwquality
+    state: present
+  when: ansible_facts['os_family'] == 'RedHat'
+  tags: [password_policy, pwquality]
+
+- name: 配置口令复杂度 /etc/security/pwquality.conf（长度不小于8位，至少含3类字符）
+  ansible.builtin.lineinfile:
+    path: /etc/security/pwquality.conf
+    regexp: '^#?\s*{{ item.key }}\s*=.*$'
+    line: "{{ item.key }} = {{ item.value }}"
+    create: true
+    state: present
+  loop:
+    - { key: "minlen",    value: "{{ pw_minlen }}" }
+    - { key: "minclass",  value: "{{ pw_minclass }}" }
+    - { key: "maxrepeat", value: "{{ pw_maxrepeat }}" }
+    - { key: "dictcheck", value: "{{ pw_dictcheck }}" }
+  tags: [password_policy, pwquality]
+
+- name: 检查 RHEL 系 PAM 是否已启用 pam_pwquality
+  ansible.builtin.command: "grep -c pam_pwquality {{ item }}"
+  loop:
+    - /etc/pam.d/system-auth
+    - /etc/pam.d/password-auth
+  register: rhel_pwquality_check
+  changed_when: false
+  failed_when: false
+  when: ansible_facts['os_family'] == 'RedHat'
+  tags: [password_policy, pwquality]
+
+- name: RHEL 系兜底启用 pam_pwquality（仅当缺失时插入）
+  ansible.builtin.lineinfile:
+    path: "{{ item.item }}"
+    line: "password    requisite     pam_pwquality.so try_first_pass local_users_only retry=3"
+    insertbefore: '^password\s+.*pam_unix\.so'
+    state: present
+  loop: "{{ rhel_pwquality_check.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - item.stdout | default('1') == '0'
+  tags: [password_policy, pwquality]
+
+- name: Ubuntu 确保 /etc/pam.d/common-password 启用 pam_pwquality
+  ansible.builtin.lineinfile:
+    path: /etc/pam.d/common-password
+    regexp: '^password\s+requisite\s+pam_pwquality\.so.*$'
+    line: "password requisite pam_pwquality.so retry=3"
+    insertbefore: '^password\s+.*pam_unix\.so'
+    state: present
+  when: ansible_facts['os_family'] == 'Debian'
+  tags: [password_policy, pwquality]
+
+# ---------- 对现有可登录账户应用 90 天口令有效期（幂等，仅调整不符合的账户） ----------
+- name: 对现有可登录账户应用口令定期更改策略（chage）
+  ansible.builtin.shell: |
+    set -euo pipefail
+    changed=0
+    while IFS=: read -r user _ uid _ _ _ _ shell; do
+      case "$shell" in
+        */nologin|*/false|*/sync|*/shutdown|*/halt) continue ;;
+      esac
+      cur=$(awk -F: -v u="$user" '$1==u {print $5+0}' /etc/shadow)
+      if [ "$cur" != "{{ pass_max_days }}" ]; then
+        chage -M {{ pass_max_days }} -m {{ pass_min_days }} -W {{ pass_warn_age }} "$user"
+        changed=1
+        echo "已设置: $user (原口令最长有效期: ${cur})"
+      fi
+    done < /etc/passwd
+    echo "CHANGED_FLAG=$changed"
+  args:
+    executable: /bin/bash
+  register: chage_apply
+  changed_when: "'CHANGED_FLAG=1' in chage_apply.stdout"
+  when: apply_chage_to_existing_users | bool
+  tags: [password_policy, chage]

@@ -1,0 +1,164 @@
+---
+# =====================================================================
+# 等保三级 - 任务3：SSH 加固（禁用 root 登录 + 修改 SSH 端口）
+# 顺序：先放行防火墙/SELinux 新端口 → 再改 sshd_config（防止改完失联）
+# =====================================================================
+
+# ---------- 0. 事实收集 ----------
+- name: 收集系统服务状态（判断 firewalld/ufw 是否运行）
+  ansible.builtin.service_facts:
+  tags: [ssh_hardening]
+
+# ---------- 1. 防火墙预放行新端口 ----------
+- name: firewalld 永久放行新 SSH 端口 {{ ssh_new_port }}
+  ansible.builtin.command: firewall-cmd --permanent --add-port={{ ssh_new_port }}/tcp
+  register: firewalld_add
+  changed_when: "'ALREADY_ENABLED' not in firewalld_add.stdout"
+  notify: 重载 firewalld
+  when:
+    - ansible_facts['services']['firewalld.service'] is defined
+    - ansible_facts['services']['firewalld.service']['state'] == 'running'
+  tags: [ssh_hardening, firewall]
+
+- name: 检查 ufw 防火墙状态
+  ansible.builtin.command: ufw status
+  register: ufw_status
+  changed_when: false
+  failed_when: false
+  when: ansible_facts['os_family'] == 'Debian'
+  tags: [ssh_hardening, firewall]
+
+- name: ufw 放行新 SSH 端口 {{ ssh_new_port }}
+  ansible.builtin.command: ufw allow {{ ssh_new_port }}/tcp
+  register: ufw_allow
+  changed_when: "'Rule added' in ufw_allow.stdout"
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - ufw_status.rc | default(1) == 0
+    - "'Status: active' in ufw_status.stdout"
+  tags: [ssh_hardening, firewall]
+
+# ---------- 2. SELinux 放行新端口（RHEL 系且 SELinux 启用时） ----------
+- name: RHEL8+ 安装 policycoreutils-python-utils（semanage 工具）
+  ansible.builtin.package:
+    name: policycoreutils-python-utils
+    state: present
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - os_major_version | int >= 8
+    - ansible_facts['selinux']['status'] | default('disabled') == 'enabled'
+  tags: [ssh_hardening, selinux]
+
+- name: CentOS7/Anolis7 安装 policycoreutils-python（semanage 工具）
+  ansible.builtin.package:
+    name: policycoreutils-python
+    state: present
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - os_major_version | int < 8
+    - ansible_facts['selinux']['status'] | default('disabled') == 'enabled'
+  tags: [ssh_hardening, selinux]
+
+- name: SELinux 为新 SSH 端口 {{ ssh_new_port }} 添加标注（ssh_port_t）
+  ansible.builtin.shell: |
+    if semanage port -l | grep -E 'ssh_port_t\s+tcp\s+[^,]*\b{{ ssh_new_port }}\b' >/dev/null 2>&1; then
+      echo "ALREADY_SET"
+    else
+      semanage port -a -t ssh_port_t -p tcp {{ ssh_new_port }} 2>/dev/null || \
+        semanage port -m -t ssh_port_t -p tcp {{ ssh_new_port }}
+      echo "PORT_ADDED"
+    fi
+  register: semanage_port
+  changed_when: "'PORT_ADDED' in semanage_port.stdout"
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - ansible_facts['selinux']['status'] | default('disabled') == 'enabled'
+  tags: [ssh_hardening, selinux]
+
+# ---------- 3. 修改 SSH 端口 ----------
+- name: Ubuntu/Debian 检测 ssh.socket（systemd socket 激活模式）
+  ansible.builtin.command: systemctl is-enabled ssh.socket
+  register: ssh_socket_state
+  changed_when: false
+  failed_when: false
+  when: ansible_facts['os_family'] == 'Debian'
+  tags: [ssh_hardening, sshd]
+
+- name: Ubuntu/Debian 关闭 socket 激活改用标准 sshd 监听（否则 sshd_config 端口不生效）
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if systemctl is-enabled ssh.socket >/dev/null 2>&1; then
+      systemctl disable --now ssh.socket
+      echo "SOCKET_DISABLED"
+    else
+      echo "ALREADY_DISABLED"
+    fi
+  args:
+    executable: /bin/bash
+  register: ssh_socket_disable
+  changed_when: "'SOCKET_DISABLED' in ssh_socket_disable.stdout"
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - ssh_socket_state.rc | default(1) == 0
+  notify: 重启 sshd
+  tags: [ssh_hardening, sshd]
+
+- name: 检查 /etc/ssh/sshd_config.d 目录是否存在
+  ansible.builtin.stat:
+    path: /etc/ssh/sshd_config.d
+  register: sshd_config_d_dir
+  tags: [ssh_hardening, sshd]
+
+- name: 查找 sshd_config.d 中所有 drop-in 配置文件
+  ansible.builtin.find:
+    paths: /etc/ssh/sshd_config.d
+    patterns: "*.conf"
+  register: sshd_config_d_files
+  when: sshd_config_d_dir.stat.exists | default(false)
+  tags: [ssh_hardening, sshd]
+
+- name: 移除 sshd_config.d 中的 Port 配置（避免 drop-in 覆盖主配置端口）
+  ansible.builtin.lineinfile:
+    path: "{{ item.path }}"
+    regexp: '^Port\s+'
+    state: absent
+  loop: "{{ sshd_config_d_files.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }}"
+  tags: [ssh_hardening, sshd]
+
+- name: 移除 sshd_config 中多余的原有 Port 配置行（保留目标端口行）
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^Port\s+(?!{{ ssh_new_port }}\s*$)'
+    state: absent
+  tags: [ssh_hardening, sshd]
+
+- name: 配置新 SSH 端口 {{ ssh_new_port }}
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?Port\s+'
+    line: "Port {{ ssh_new_port }}"
+    validate: /usr/sbin/sshd -t -f %s
+    state: present
+  notify: 重启 sshd
+  tags: [ssh_hardening, sshd]
+
+# ---------- 4. 禁用 root SSH 登录 ----------
+- name: 禁用 root SSH 直接登录（PermitRootLogin {{ ssh_permit_root_login }}）
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PermitRootLogin\s+'
+    line: "PermitRootLogin {{ ssh_permit_root_login }}"
+    validate: /usr/sbin/sshd -t -f %s
+    state: present
+  notify: 重启 sshd
+  tags: [ssh_hardening, sshd]
+
+- name: 输出 SSH 加固结果提醒
+  ansible.builtin.debug:
+    msg:
+      - "SSH 端口已配置为 {{ ssh_new_port }}，root 直接登录已设置为 {{ ssh_permit_root_login }}。"
+      - "重启 sshd 不会中断当前已建立的连接；新连接请使用新端口。"
+      - "后续再次运行 playbook 时，请在 inventory/hosts.yml 中为该主机设置 ansible_port: {{ ssh_new_port }}。"
+  tags: [ssh_hardening]
